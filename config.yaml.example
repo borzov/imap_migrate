@@ -4,11 +4,17 @@
 # Скопируйте в config.yaml и подставьте свои данные:
 #   cp config.yaml.example config.yaml
 # config.yaml в .gitignore — пароли не попадут в репозиторий.
+#
+# Примеры IMAP-серверов (источник или назначение):
+#   Яндекс:     host: imap.yandex.ru, port: 993 (пароль приложения!)
+#   Gmail:       host: imap.gmail.com, port: 993 (пароль приложения!)
+#   Mail.ru:     host: imap.mail.ru, port: 993
+#   Свой сервер: host: mail.yourdomain.com, port: 993
 # =============================================================================
 
-# ---------- Источник (Яндекс 360) ----------
+# ---------- Источник (IMAP-сервер, с которого переносим) ----------
 source:
-  host: imap.yandex.ru
+  host: ""   # обязательно укажите, напр. imap.yandex.ru или imap.gmail.com
   port: 993
   user: your-email@example.com
   password: your-app-password
@@ -35,10 +41,12 @@ options:
   folder_retries: 3
   noop_interval: 30
   reconnect_max_wait: 300
+  status_interval: 600   # интервал вывода прогресса в лог (сек), 0 — отключить
+  use_builtin_map: true  # автомаппинг папок (Яндекс/Gmail/Mail.ru → INBOX, Sent, Junk и т.д.)
   # exclude_flags: []
   verbose: false
 
-# ---------- Маппинг папок (при необходимости) ----------
+# ---------- Маппинг папок (при необходимости, иначе встроенный маппинг) ----------
 # folder_map:
 #   "Входящие": "INBOX"
 #   "Отправленные": "Sent"

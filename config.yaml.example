@@ -1,0 +1,54 @@
+# =============================================================================
+# IMAP Migration — пример конфигурации
+# =============================================================================
+# Скопируйте в config.yaml и подставьте свои данные:
+#   cp config.yaml.example config.yaml
+# config.yaml в .gitignore — пароли не попадут в репозиторий.
+# =============================================================================
+
+# ---------- Источник (Яндекс 360) ----------
+source:
+  host: imap.yandex.ru
+  port: 993
+  user: your-email@example.com
+  password: your-app-password
+  ssl: true
+
+# ---------- Назначение (ваш IMAP-сервер) ----------
+destination:
+  host: mail.yourdomain.com
+  port: 993
+  user: your-email@yourdomain.com
+  password: your-password-here
+  ssl: true
+  # starttls: false   # раскомментировать, если сервер использует STARTTLS
+
+# ---------- Настройки миграции ----------
+options:
+  max_retries: 3
+  state_file: migration_state.json
+  log_file: migration.log
+  timeout: 120
+  throttle: 0.05
+  batch_limit: 0
+  scan_batch_size: 100
+  folder_retries: 3
+  noop_interval: 30
+  reconnect_max_wait: 300
+  # exclude_flags: []
+  verbose: false
+
+# ---------- Маппинг папок (при необходимости) ----------
+# folder_map:
+#   "Входящие": "INBOX"
+#   "Отправленные": "Sent"
+#   "Черновики": "Drafts"
+#   "Спам": "Junk"
+#   "Удалённые": "Trash"
+
+# ---------- Фильтрация папок ----------
+# only_folders:
+#   - INBOX
+#   - Sent
+# exclude_folders:
+#   - Спам

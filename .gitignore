@@ -1,0 +1,18 @@
+# Конфиг с паролями — не коммитить
+config.yaml
+
+# Виртуальное окружение
+.venv/
+venv/
+env/
+
+# Состояние и логи миграции
+migration_state.json
+migration.log
+*.tmp
+
+# Прочее
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo

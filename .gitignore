@@ -9,9 +9,11 @@ env/
 # Состояние и логи миграции
 migration_state.json
 migration.log
+.migration.pause
 *.tmp
 
 # Прочее
+CLAUDE.md
 .DS_Store
 __pycache__/
 *.pyc

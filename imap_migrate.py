@@ -2,15 +2,15 @@
 """
 IMAP Mail Migration Tool
 ========================
-Переносит почту между IMAP-серверами (Яндекс 360 -> свой сервер).
+Переносит почту между любыми IMAP-серверами (Яндекс, Gmail, Mail.ru, свой сервер и др.).
 
 Возможности:
   - Докачка (resume): пропускает уже перенесённые письма по Message-ID
   - Прогресс-бар с ETA, скоростью и объёмом (tqdm)
   - Верификация: подсчёт писем на источнике и приёмнике после переноса
-  - Graceful shutdown по Ctrl+C с сохранением состояния
+  - Graceful shutdown по Ctrl+C с сохранением состояния; пауза по SIGUSR1 или файлу
   - Подсчёт и отображение размера перенесённых данных
-  - Автомаппинг русских папок Яндекса на стандартные IMAP-имена
+  - Автомаппинг папок (Яндекс, Gmail, Mail.ru и др.) на стандартные IMAP-имена
   - Сохранение флагов и INTERNALDATE
   - Автопереподключение при обрывах (с экспоненциальным backoff)
   - Подробный итоговый отчёт с разбивкой по папкам
@@ -29,6 +29,7 @@ import email.utils
 import json
 import logging
 import argparse
+import os
 import signal
 import ssl
 import sys
@@ -59,7 +60,7 @@ imaplib._MAXLINE = 10_000_000
 # ---------------------------------------------------------------------------
 # ANSI-цвета для консоли
 # ---------------------------------------------------------------------------
-class C:
+class Colors:
     """ANSI color codes. Автоотключение если stdout не терминал."""
     _enabled = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
 
@@ -94,6 +95,22 @@ def human_duration(seconds: float) -> str:
         h, rem = divmod(int(seconds), 3600)
         m, s = divmod(rem, 60)
         return f"{h} ч {m} мин"
+
+
+def friendly_error(e: Exception) -> str:
+    """Returns a user-friendly message for known connection/IMAP errors."""
+    msg = str(e).strip()
+    if "Broken pipe" in msg or "Errno 32" in msg:
+        return "Соединение разорвано (Broken pipe)"
+    if "nodename nor servname" in msg or "Errno 8" in msg:
+        return "DNS-ошибка: сервер недоступен"
+    if "EOF" in msg or "Connection reset" in msg:
+        return "Сервер закрыл соединение"
+    if "timed out" in msg or "timeout" in msg.lower():
+        return "Таймаут соединения"
+    if "Connection refused" in msg:
+        return "Подключение отклонено (порт закрыт или сервер недоступен)"
+    return msg
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +162,12 @@ class ServerConfig:
     ssl: bool = True
     starttls: bool = False
 
+    def __repr__(self) -> str:
+        pwd = "***" if self.password else ""
+        return (f"ServerConfig(host={self.host!r}, port={self.port}, "
+                f"user={self.user!r}, password={pwd!r}, "
+                f"ssl={self.ssl}, starttls={self.starttls})")
+
 
 @dataclass
 class MigrationConfig:
@@ -153,9 +176,9 @@ class MigrationConfig:
     batch_limit: int = 0
     state_file: str = "migration_state.json"
     log_file: str = "migration.log"
-    folder_map: dict = field(default_factory=dict)
-    exclude_folders: list = field(default_factory=list)
-    only_folders: list = field(default_factory=list)
+    folder_map: dict[str, str] = field(default_factory=dict)
+    exclude_folders: list[str] = field(default_factory=list)
+    only_folders: list[str] = field(default_factory=list)
     timeout: int = 120
     throttle: float = 0.05
     max_retries: int = 3
@@ -165,13 +188,15 @@ class MigrationConfig:
     folder_retries: int = 3
     noop_interval: int = 30
     reconnect_max_wait: int = 300
-    exclude_flags: list = field(default_factory=list)
+    status_interval: int = 600
+    use_builtin_map: bool = True
+    exclude_flags: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
-# Маппинг папок Яндекс -> стандартные IMAP-имена
+# Built-in folder name mapping (Yandex, Mail.ru, Gmail, etc.) -> standard IMAP
 # ---------------------------------------------------------------------------
-YANDEX_FOLDER_MAP = {
+BUILTIN_FOLDER_MAP = {
     "Входящие": "INBOX",
     "Отправленные": "Sent",
     "Черновики": "Drafts",
@@ -183,6 +208,12 @@ YANDEX_FOLDER_MAP = {
     "Spam": "Junk",
     "Trash": "Trash",
     "Outbox": "Outbox",
+    "INBOX": "INBOX",
+    "[Gmail]/Sent Mail": "Sent",
+    "[Gmail]/Drafts": "Drafts",
+    "[Gmail]/Trash": "Trash",
+    "[Gmail]/Spam": "Junk",
+    "Корзина": "Trash",
 }
 
 
@@ -190,12 +221,14 @@ YANDEX_FOLDER_MAP = {
 # State management -- докачка
 # ---------------------------------------------------------------------------
 class MigrationState:
-    """Хранит Message-ID уже перенесённых писем + статистику по папкам."""
+    """Хранит Message-ID уже перенесённых писем + статистику по папкам + UID-кэш для быстрого resume."""
 
     def __init__(self, state_file: str):
         self.state_file = Path(state_file)
         self.migrated: dict[str, set[str]] = {}
         self.folder_stats: dict[str, dict] = {}
+        self.uid_cache: dict[str, set[str]] = {}
+        self.uidvalidity: dict[str, str] = {}
         self._load()
 
     def _load(self):
@@ -206,9 +239,13 @@ class MigrationState:
                     if isinstance(ids, list):
                         self.migrated[folder] = set(ids)
                 self.folder_stats = data.get("folder_stats", {})
+                for folder, uids in data.get("uid_cache", {}).items():
+                    if isinstance(uids, list):
+                        self.uid_cache[folder] = set(uids)
+                self.uidvalidity = data.get("uidvalidity", {})
                 total = sum(len(v) for v in self.migrated.values())
                 logging.info(
-                    f"Загружено состояние: {C.CYAN}{total}{C.RESET} писем "
+                    f"Загружено состояние: {Colors.CYAN}{total}{Colors.RESET} писем "
                     f"в {len(self.migrated)} папках"
                 )
             except Exception as e:
@@ -218,6 +255,8 @@ class MigrationState:
         data = {
             "migrated": {f: sorted(ids) for f, ids in self.migrated.items()},
             "folder_stats": self.folder_stats,
+            "uid_cache": {f: sorted(uids) for f, uids in self.uid_cache.items()},
+            "uidvalidity": self.uidvalidity,
             "saved_at": datetime.now().isoformat(),
         }
         tmp = self.state_file.with_suffix(".tmp")
@@ -227,11 +266,28 @@ class MigrationState:
     def is_migrated(self, folder: str, message_id: str) -> bool:
         return message_id in self.migrated.get(folder, set())
 
-    def mark_migrated(self, folder: str, message_id: str, msg_size: int = 0):
+    def mark_migrated(
+        self, folder: str, message_id: str, msg_size: int = 0, src_uid: Optional[str] = None
+    ):
         self.migrated.setdefault(folder, set()).add(message_id)
         fs = self.folder_stats.setdefault(folder, {"count": 0, "bytes": 0})
         fs["count"] += 1
         fs["bytes"] += msg_size
+        if src_uid:
+            self.uid_cache.setdefault(folder, set()).add(src_uid)
+
+    def get_cached_uids(self, dst_folder: str) -> set[str]:
+        return self.uid_cache.get(dst_folder, set()).copy()
+
+    def set_uidvalidity(self, src_folder: str, value: str):
+        self.uidvalidity[src_folder] = value
+
+    def get_uidvalidity(self, src_folder: str) -> Optional[str]:
+        return self.uidvalidity.get(src_folder)
+
+    def invalidate_uid_cache(self, dst_folder: str, src_folder: str):
+        self.uid_cache.pop(dst_folder, None)
+        self.uidvalidity.pop(src_folder, None)
 
     def count(self, folder: str) -> int:
         return len(self.migrated.get(folder, set()))
@@ -319,6 +375,20 @@ def list_folders(conn: imaplib.IMAP4) -> list[str]:
             folders.append(name_part)
 
     return folders
+
+
+def get_folder_uidvalidity(conn: imaplib.IMAP4, folder: str) -> Optional[str]:
+    """Returns UIDVALIDITY for the folder (for cache validation)."""
+    try:
+        status, data = conn.status(f'"{folder}"', "(UIDVALIDITY)")
+        if status == "OK" and data and data[0]:
+            raw = data[0] if isinstance(data[0], bytes) else data[0].encode()
+            m = re.search(rb"UIDVALIDITY\s+(\d+)", raw)
+            if m:
+                return m.group(1).decode()
+    except Exception:
+        pass
+    return None
 
 
 def folder_message_count(conn: imaplib.IMAP4, folder: str) -> int:
@@ -439,20 +509,25 @@ def upload_message(
         status, _ = conn.append(f'"{folder}"', flag_str, date_str, raw_message)
         return status == "OK"
     except Exception as e:
-        logging.error(f"Ошибка APPEND в '{folder}': {e}")
+        logging.debug(f"APPEND exception: {e}", exc_info=True)
+        logging.error(f"Ошибка APPEND в '{folder}': {friendly_error(e)}")
         return False
 
 
 def ensure_folder_exists(conn: imaplib.IMAP4, folder: str):
     """Создаёт папку на целевом сервере, если её нет."""
-    status, _ = conn.select(f'"{folder}"')
-    if status != "OK":
-        logging.info(f"  Создаю папку: {C.CYAN}{folder}{C.RESET}")
-        try:
-            conn.create(f'"{folder}"')
-            conn.subscribe(f'"{folder}"')
-        except Exception as e:
-            logging.warning(f"  Не удалось создать папку '{folder}': {e}")
+    try:
+        status, _ = conn.status(f'"{folder}"', "(MESSAGES)")
+        if status == "OK":
+            return
+    except imaplib.IMAP4.error:
+        pass
+    logging.info(f"  Создаю папку: {Colors.CYAN}{folder}{Colors.RESET}")
+    try:
+        conn.create(f'"{folder}"')
+        conn.subscribe(f'"{folder}"')
+    except Exception as e:
+        logging.warning(f"  Не удалось создать папку '{folder}': {friendly_error(e)}")
 
 
 # ---------------------------------------------------------------------------
@@ -474,10 +549,30 @@ class IMAPMigrator:
             "bytes_transferred": 0,
         }
         self.folder_reports: list[dict] = []
+        self._paused = False
+        self._pause_logged = False
+        self.pause_file = Path(config.state_file).resolve().parent / ".migration.pause"
 
         # Graceful shutdown
         signal.signal(signal.SIGINT, self._handle_interrupt)
         signal.signal(signal.SIGTERM, self._handle_interrupt)
+        sigusr1 = getattr(signal, "SIGUSR1", None)
+        if sigusr1 is not None:
+            signal.signal(sigusr1, self._handle_pause)
+
+    def _is_paused(self) -> bool:
+        """True if pause was requested via SIGUSR1 or pause file (Windows)."""
+        return self._paused or self.pause_file.exists()
+
+    def _handle_pause(self, signum, frame):
+        self._paused = not self._paused
+        if self._paused:
+            self.state.save()
+            logging.warning(
+                f"\n{Colors.YELLOW}Пауза. Отправьте SIGUSR1 снова или удалите {self.pause_file} для продолжения.{Colors.RESET}"
+            )
+        else:
+            logging.info(f"  {Colors.GREEN}Возобновление{Colors.RESET}")
 
     def _handle_interrupt(self, signum, frame):
         if self._interrupted:
@@ -485,18 +580,19 @@ class IMAPMigrator:
             sys.exit(1)
         self._interrupted = True
         logging.warning(
-            f"\n{C.YELLOW}Получен сигнал прерывания. "
-            f"Завершаю текущее письмо и сохраняю состояние...{C.RESET}"
+            f"\n{Colors.YELLOW}Получен сигнал прерывания. "
+            f"Завершаю текущее письмо и сохраняю состояние...{Colors.RESET}"
         )
 
     def resolve_dest_folder(self, src_folder: str) -> str:
         if src_folder in self.config.folder_map:
             return self.config.folder_map[src_folder]
         decoded = decode_folder_name(src_folder)
-        if decoded in YANDEX_FOLDER_MAP:
-            return YANDEX_FOLDER_MAP[decoded]
-        if src_folder in YANDEX_FOLDER_MAP:
-            return YANDEX_FOLDER_MAP[src_folder]
+        if self.config.use_builtin_map:
+            if decoded in BUILTIN_FOLDER_MAP:
+                return BUILTIN_FOLDER_MAP[decoded]
+            if src_folder in BUILTIN_FOLDER_MAP:
+                return BUILTIN_FOLDER_MAP[src_folder]
         return decoded
 
     def should_process_folder(self, folder: str) -> bool:
@@ -511,15 +607,25 @@ class IMAPMigrator:
         prefix = f"[{label}] " if label else ""
         max_wait = max(2, self.config.reconnect_max_wait)
         wait = 2
+        reconnect_start: Optional[float] = None
         while not self._interrupted:
             try:
                 logging.info(f"  {prefix}Переподключение к серверам...")
                 src = connect_imap(self.config.source, self.config.timeout)
                 dst = connect_imap(self.config.destination, self.config.timeout)
+                if reconnect_start is not None:
+                    lost_sec = time.time() - reconnect_start
+                    logging.info(
+                        f"  {prefix}{Colors.GREEN}Соединение восстановлено{Colors.RESET} "
+                        f"(потеряно: {human_duration(lost_sec)})"
+                    )
                 return src, dst
             except Exception as e:
+                if reconnect_start is None:
+                    reconnect_start = time.time()
+                logging.debug(f"Reconnect failed: {e}", exc_info=True)
                 logging.warning(
-                    f"  {prefix}Сеть недоступна: {e}. Повтор через {wait} сек..."
+                    f"  {prefix}{friendly_error(e)}. Повтор через {wait} сек..."
                 )
                 time.sleep(wait)
                 wait = min(wait * 2, max_wait)
@@ -567,19 +673,27 @@ class IMAPMigrator:
             except (imaplib.IMAP4.abort, imaplib.IMAP4.error, OSError, BrokenPipeError) as e:
                 if attempt < max_retries:
                     wait = min(2 ** attempt, 30)
-                    logging.warning(f"  Получение UID: {e}, повтор через {wait} сек...")
+                    logging.warning(
+                        f"  Получение UID: {friendly_error(e)}. Повтор через {wait} сек..."
+                    )
                     time.sleep(wait)
                     src_conn, dst_conn = self._reconnect(folder)
                 else:
                     raise
         return [], src_conn, dst_conn
 
-    def migrate_folder(self, src_conn, dst_conn, src_folder: str, dst_folder: str):
+    def migrate_folder(
+        self,
+        src_conn: imaplib.IMAP4,
+        dst_conn: imaplib.IMAP4,
+        src_folder: str,
+        dst_folder: str,
+    ) -> tuple[imaplib.IMAP4, imaplib.IMAP4]:
         """Migrates one folder using batch scan+transfer. Returns (src_conn, dst_conn)."""
-        mode_tag = f"{C.YELLOW}DRY-RUN{C.RESET} " if self.dry_run else ""
+        mode_tag = f"{Colors.YELLOW}DRY-RUN{Colors.RESET} " if self.dry_run else ""
         logging.info(
-            f"\n{C.BOLD}{'=' * 50}{C.RESET}\n"
-            f"  {mode_tag}{C.BOLD}{src_folder}{C.RESET} -> {C.CYAN}{dst_folder}{C.RESET}"
+            f"\n{Colors.BOLD}{'=' * 50}{Colors.RESET}\n"
+            f"  {mode_tag}{Colors.BOLD}{src_folder}{Colors.RESET} -> {Colors.CYAN}{dst_folder}{Colors.RESET}"
         )
 
         src_conn, dst_conn = self._ensure_connection_healthy(src_conn, dst_conn, src_folder)
@@ -589,7 +703,7 @@ class IMAPMigrator:
         total = len(uids)
 
         if total == 0:
-            logging.info(f"  {C.GREEN}Папка пуста{C.RESET}")
+            logging.info(f"  {Colors.GREEN}Папка пуста{Colors.RESET}")
             self.folder_reports.append({
                 "src": src_folder, "dst": dst_folder,
                 "total": 0, "skipped": 0, "migrated": 0, "errors": 0,
@@ -597,16 +711,36 @@ class IMAPMigrator:
             })
             return src_conn, dst_conn
 
+        current_uv = get_folder_uidvalidity(src_conn, src_folder)
+        cached_uids: set[str] = set()
+        if current_uv and current_uv == self.state.get_uidvalidity(src_folder):
+            cached_uids = self.state.get_cached_uids(dst_folder)
+        elif current_uv:
+            self.state.invalidate_uid_cache(dst_folder, src_folder)
+        if current_uv:
+            self.state.set_uidvalidity(src_folder, current_uv)
+
+        uids_decoded = [(uid, uid.decode()) for uid in uids]
+        skipped_by_cache = {s for _, s in uids_decoded if s in cached_uids}
+        uids_to_scan = [uid for uid, s in uids_decoded if s not in cached_uids]
+
+        if skipped_by_cache:
+            logging.info(
+                f"  Кэш UID: пропущено {len(skipped_by_cache):,} писем "
+                f"(без FETCH). К сканированию: {len(uids_to_scan):,}"
+            )
+
         if HAS_TQDM and not self.dry_run and total > 500:
-            logging.info(f"  Всего: {C.BOLD}{total}{C.RESET} писем (батчи по {self.config.scan_batch_size})")
+            logging.info(f"  Всего: {Colors.BOLD}{total}{Colors.RESET} писем (батчи по {self.config.scan_batch_size})")
 
         folder_report = {
             "src": src_folder, "dst": dst_folder,
-            "total": total, "skipped": 0,
+            "total": total, "skipped": len(skipped_by_cache),
             "migrated": 0, "errors": 0,
             "bytes": 0, "elapsed": 0.0,
         }
         self.stats["total_scanned"] += total
+        self.stats["skipped_existing"] += len(skipped_by_cache)
 
         if not self.dry_run:
             ensure_folder_exists(dst_conn, dst_folder)
@@ -625,17 +759,20 @@ class IMAPMigrator:
                 ),
                 dynamic_ncols=True,
             )
+            if skipped_by_cache:
+                pbar.update(len(skipped_by_cache))
 
         folder_start = time.time()
         last_noop = time.time()
+        last_status_time = folder_start
         total_migrated_this_run = 0
 
-        for batch_start in range(0, total, batch_size):
+        for batch_start in range(0, len(uids_to_scan), batch_size):
             if self._interrupted:
                 logging.warning("  Прерывание -- сохраняю состояние...")
                 break
 
-            batch_uids = uids[batch_start:batch_start + batch_size]
+            batch_uids = uids_to_scan[batch_start:batch_start + batch_size]
 
             if self.config.noop_interval > 0 and (time.time() - last_noop) >= self.config.noop_interval:
                 self._noop(src_conn)
@@ -656,13 +793,21 @@ class IMAPMigrator:
                 (uid, mid) for uid, mid in batch_messages
                 if not self.state.is_migrated(
                     dst_folder,
-                    mid if mid else f"__uid_{uid.decode()}_{src_folder}"
+                    mid if mid else f"__uid_{uid.decode()}_{src_folder}",
                 )
             ]
             folder_report["skipped"] += len(batch_messages) - len(to_migrate_batch)
             self.stats["skipped_existing"] += len(batch_messages) - len(to_migrate_batch)
 
             for uid, msg_id in to_migrate_batch:
+                if self._interrupted:
+                    break
+                if self._is_paused() and not self._interrupted:
+                    logging.warning(
+                        f"  Пауза (SIGUSR1 или удалите {self.pause_file} для продолжения)"
+                    )
+                    while self._is_paused() and not self._interrupted:
+                        time.sleep(1)
                 if self._interrupted:
                     break
                 unique_key = msg_id if msg_id else f"__uid_{uid.decode()}_{src_folder}"
@@ -687,7 +832,9 @@ class IMAPMigrator:
                             exclude_flags=set(self.config.exclude_flags),
                         )
                         if ok:
-                            self.state.mark_migrated(dst_folder, unique_key, msg_size)
+                            self.state.mark_migrated(
+                                dst_folder, unique_key, msg_size, src_uid=uid.decode()
+                            )
                             self.stats["migrated_ok"] += 1
                             self.stats["bytes_transferred"] += msg_size
                             folder_report["migrated"] += 1
@@ -696,12 +843,12 @@ class IMAPMigrator:
                             success = True
                             break
                         logging.warning(
-                            f"  APPEND failed uid={uid.decode()} "
+                            f"  Ошибка записи uid={uid.decode()}: сервер отклонил APPEND "
                             f"(попытка {attempt}/{self.config.max_retries})"
                         )
                     except (imaplib.IMAP4.abort, imaplib.IMAP4.error, OSError, BrokenPipeError) as e:
                         logging.warning(
-                            f"  Ошибка uid={uid.decode()}: {e} "
+                            f"  Ошибка uid={uid.decode()}: {friendly_error(e)} "
                             f"(попытка {attempt}/{self.config.max_retries})"
                         )
                         if attempt < self.config.max_retries:
@@ -728,11 +875,24 @@ class IMAPMigrator:
             if pbar:
                 pbar.update(len(batch_messages) - len(to_migrate_batch))
 
+            processed = len(skipped_by_cache) + batch_start + len(batch_messages)
+            if (
+                self.config.status_interval > 0
+                and (time.time() - last_status_time) >= self.config.status_interval
+            ):
+                last_status_time = time.time()
+                pct = 100.0 * processed / total if total else 0
+                elapsed = last_status_time - folder_start
+                rate = processed / elapsed if elapsed > 0 else 0
+                remaining = total - processed
+                eta_sec = remaining / rate if rate > 0 else 0
+                logging.info(
+                    f"  [{src_folder}] Прогресс: {processed:,} / {total:,} ({pct:.1f}%) — "
+                    f"{human_size(folder_report['bytes'])} — ETA ~{human_duration(eta_sec)}"
+                )
+
             if self.config.throttle > 0:
                 time.sleep(self.config.throttle)
-
-            if 0 < self.config.batch_limit <= total_migrated_this_run:
-                break
 
             self.state.save()
             if 0 < self.config.batch_limit <= total_migrated_this_run:
@@ -748,14 +908,14 @@ class IMAPMigrator:
         fr = folder_report
         skip_count = fr["skipped"]
         logging.info(
-            f"  Всего: {C.BOLD}{total}{C.RESET} | "
-            f"Уже перенесено: {C.GREEN}{skip_count}{C.RESET} | "
-            f"К переносу: {C.CYAN}{fr['migrated']}{C.RESET}"
+            f"  Всего: {Colors.BOLD}{total}{Colors.RESET} | "
+            f"Уже перенесено: {Colors.GREEN}{skip_count}{Colors.RESET} | "
+            f"К переносу: {Colors.CYAN}{fr['migrated']}{Colors.RESET}"
         )
         speed = fr["bytes"] / fr["elapsed"] if fr["elapsed"] > 0 else 0
-        err_str = f" | {C.RED}Ошибки: {fr['errors']}{C.RESET}" if fr["errors"] else ""
+        err_str = f" | {Colors.RED}Ошибки: {fr['errors']}{Colors.RESET}" if fr["errors"] else ""
         logging.info(
-            f"  {C.GREEN}Готово:{C.RESET} +{fr['migrated']} писем, "
+            f"  {Colors.GREEN}Готово:{Colors.RESET} +{fr['migrated']} писем, "
             f"{human_size(fr['bytes'])}, "
             f"{human_duration(fr['elapsed'])} "
             f"({human_size(speed)}/s){err_str}"
@@ -766,8 +926,8 @@ class IMAPMigrator:
 
     def verify_counts(self, src_conn, dst_conn, folders: list[tuple[str, str]]):
         """Верификация: сравнение количества писем на источнике и приёмнике."""
-        logging.info(f"\n{C.BOLD}{'=' * 50}{C.RESET}")
-        logging.info(f"{C.BOLD}  ВЕРИФИКАЦИЯ{C.RESET}")
+        logging.info(f"\n{Colors.BOLD}{'=' * 50}{Colors.RESET}")
+        logging.info(f"{Colors.BOLD}  ВЕРИФИКАЦИЯ{Colors.RESET}")
         logging.info(f"{'=' * 50}")
 
         all_ok = True
@@ -783,7 +943,7 @@ class IMAPMigrator:
                 continue
 
             match = src_count == dst_count
-            icon = f"{C.GREEN}OK{C.RESET}" if match else f"{C.RED}MISMATCH{C.RESET}"
+            icon = f"{Colors.GREEN}OK{Colors.RESET}" if match else f"{Colors.RED}MISMATCH{Colors.RESET}"
             logging.info(
                 f"  {src_f} -> {dst_f}: "
                 f"src={src_count} dst={dst_count} [{icon}]"
@@ -792,12 +952,12 @@ class IMAPMigrator:
                 all_ok = False
 
         if all_ok:
-            logging.info(f"\n  {C.GREEN}Все папки совпадают!{C.RESET}")
+            logging.info(f"\n  {Colors.GREEN}Все папки совпадают!{Colors.RESET}")
         else:
             logging.warning(
-                f"\n  {C.YELLOW}Есть расхождения. Возможные причины: "
+                f"\n  {Colors.YELLOW}Есть расхождения. Возможные причины: "
                 f"batch_limit, ошибки, или письма без Message-ID. "
-                f"Попробуйте запустить повторно.{C.RESET}"
+                f"Попробуйте запустить повторно.{Colors.RESET}"
             )
 
     def print_final_report(self, elapsed: float):
@@ -805,8 +965,8 @@ class IMAPMigrator:
         s = self.stats
         total_bytes = s["bytes_transferred"]
 
-        logging.info(f"\n{C.BOLD}{'=' * 60}{C.RESET}")
-        logging.info(f"{C.BOLD}  ИТОГОВЫЙ ОТЧЁТ{C.RESET}")
+        logging.info(f"\n{Colors.BOLD}{'=' * 60}{Colors.RESET}")
+        logging.info(f"{Colors.BOLD}  ИТОГОВЫЙ ОТЧЁТ{Colors.RESET}")
         logging.info(f"{'=' * 60}")
 
         if self.folder_reports:
@@ -816,47 +976,54 @@ class IMAPMigrator:
             )
             logging.info(f"  {'-' * 70}")
             for fr in self.folder_reports:
-                err_col = C.RED if fr["errors"] else ""
-                err_end = C.RESET if fr["errors"] else ""
+                err_col = Colors.RED if fr["errors"] else ""
+                err_end = Colors.RESET if fr["errors"] else ""
                 logging.info(
                     f"  {fr['dst']:<25} {fr['total']:>7} "
-                    f"{C.GREEN}{fr['migrated']:>7}{C.RESET} "
+                    f"{Colors.GREEN}{fr['migrated']:>7}{Colors.RESET} "
                     f"{err_col}{fr['errors']:>7}{err_end} "
                     f"{human_size(fr['bytes']):>10} "
                     f"{human_duration(fr['elapsed']):>10}"
                 )
 
         logging.info(f"\n  {'-' * 40}")
-        logging.info(f"  Просканировано писем:   {C.BOLD}{s['total_scanned']}{C.RESET}")
-        logging.info(f"  Перенесено:             {C.GREEN}{s['migrated_ok']}{C.RESET}")
+        logging.info(f"  Просканировано писем:   {Colors.BOLD}{s['total_scanned']}{Colors.RESET}")
+        logging.info(f"  Перенесено:             {Colors.GREEN}{s['migrated_ok']}{Colors.RESET}")
         logging.info(f"  Пропущено (уже есть):   {s['skipped_existing']}")
         logging.info(f"  Без Message-ID:         {s['skipped_no_msgid']}")
         if s["errors"]:
-            logging.info(f"  Ошибки:                 {C.RED}{s['errors']}{C.RESET}")
+            logging.info(f"  Ошибки:                 {Colors.RED}{s['errors']}{Colors.RESET}")
         else:
-            logging.info(f"  Ошибки:                 {C.GREEN}0{C.RESET}")
-        logging.info(f"  Объём данных:           {C.CYAN}{human_size(total_bytes)}{C.RESET}")
+            logging.info(f"  Ошибки:                 {Colors.GREEN}0{Colors.RESET}")
+        logging.info(f"  Объём данных:           {Colors.CYAN}{human_size(total_bytes)}{Colors.RESET}")
 
         speed = total_bytes / elapsed if elapsed > 0 else 0
         logging.info(f"  Средняя скорость:       {human_size(speed)}/s")
-        logging.info(f"  Общее время:            {C.BOLD}{human_duration(elapsed)}{C.RESET}")
+        logging.info(f"  Общее время:            {Colors.BOLD}{human_duration(elapsed)}{Colors.RESET}")
 
         if self._interrupted:
             logging.info(
-                f"\n  {C.YELLOW}Миграция прервана. "
-                f"Состояние сохранено -- запустите снова для продолжения.{C.RESET}"
+                f"\n  {Colors.YELLOW}Миграция прервана. "
+                f"Состояние сохранено -- запустите снова для продолжения.{Colors.RESET}"
             )
 
         logging.info(f"{'=' * 60}\n")
 
     def run(self) -> bool:
         """Основной цикл миграции."""
-        mode = f"{C.YELLOW}DRY-RUN{C.RESET}" if self.dry_run else f"{C.GREEN}ПЕРЕНОС{C.RESET}"
-        logging.info(f"\n{C.BOLD}{'=' * 60}{C.RESET}")
+        mode = f"{Colors.YELLOW}DRY-RUN{Colors.RESET}" if self.dry_run else f"{Colors.GREEN}ПЕРЕНОС{Colors.RESET}"
+        start_ts = datetime.now().strftime(DATE_FORMAT)
+        pid = os.getpid()
+        logging.info(f"\n{Colors.BOLD}{'=' * 60}{Colors.RESET}")
         logging.info(f"  IMAP Migration")
         logging.info(f"  {self.config.source.user}@{self.config.source.host}")
         logging.info(f"      -> {self.config.destination.user}@{self.config.destination.host}")
         logging.info(f"  Режим: {mode}")
+        logging.info(f"  Время старта: {start_ts}")
+        if hasattr(signal, "SIGUSR1"):
+            logging.info(f"  PID: {pid} (kill -USR1 {pid} для паузы)")
+        else:
+            logging.info(f"  PID: {pid} (создайте .migration.pause для паузы)")
         logging.info(f"{'=' * 60}")
 
         max_wait = max(2, self.config.reconnect_max_wait)
@@ -868,7 +1035,8 @@ class IMAPMigrator:
                 break
             except Exception as e:
                 logging.warning(
-                    f"  Не удалось подключиться: {e}. Повтор через {wait} сек..."
+                    f"  Не удалось подключиться: {friendly_error(e)}. "
+                    f"Повтор через {wait} сек..."
                 )
                 time.sleep(wait)
                 wait = min(wait * 2, max_wait)
@@ -876,20 +1044,20 @@ class IMAPMigrator:
             logging.critical("Прервано пользователем")
             return False
 
-        logging.info(f"  {C.GREEN}Подключение установлено{C.RESET}")
+        logging.info(f"  {Colors.GREEN}Подключение установлено{Colors.RESET}")
 
         src_folders = list_folders(src_conn)
         logging.info(f"\n  Папки на источнике ({len(src_folders)}):")
         for f in src_folders:
             dst = self.resolve_dest_folder(f)
-            skip = "" if self.should_process_folder(f) else f" {C.DIM}[пропуск]{C.RESET}"
+            skip = "" if self.should_process_folder(f) else f" {Colors.DIM}[пропуск]{Colors.RESET}"
             count = folder_message_count(src_conn, f)
             count_str = f" ({count})" if count >= 0 else ""
-            logging.info(f"    {f}{count_str} -> {C.CYAN}{dst}{C.RESET}{skip}")
+            logging.info(f"    {f}{count_str} -> {Colors.CYAN}{dst}{Colors.RESET}{skip}")
 
         folders_to_process = [f for f in src_folders if self.should_process_folder(f)]
         folder_pairs = [(f, self.resolve_dest_folder(f)) for f in folders_to_process]
-        logging.info(f"\n  К обработке: {C.BOLD}{len(folders_to_process)}{C.RESET} папок")
+        logging.info(f"\n  К обработке: {Colors.BOLD}{len(folders_to_process)}{Colors.RESET} папок")
 
         start_time = time.time()
 
@@ -947,16 +1115,20 @@ class IMAPMigrator:
 # ---------------------------------------------------------------------------
 def load_config(path: str) -> MigrationConfig:
     cfg = MigrationConfig()
-    raw = Path(path).read_text(encoding="utf-8")
-
-    if HAS_YAML:
-        data = yaml.safe_load(raw)
-    else:
-        data = json.loads(raw)
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+    except OSError as e:
+        raise RuntimeError(f"Cannot read config file '{path}': {e}") from e
+    try:
+        data = yaml.safe_load(raw) if HAS_YAML else json.loads(raw)
+    except Exception as e:
+        raise RuntimeError(f"Invalid config format in '{path}': {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError(f"Config must be a YAML/JSON mapping, got: {type(data).__name__}")
 
     src = data.get("source", {})
     cfg.source = ServerConfig(
-        host=src.get("host", "imap.yandex.ru"),
+        host=src.get("host", ""),
         port=src.get("port", 993),
         user=src.get("user", ""),
         password=src.get("password", ""),
@@ -986,11 +1158,26 @@ def load_config(path: str) -> MigrationConfig:
     cfg.folder_retries = opts.get("folder_retries", 3)
     cfg.noop_interval = opts.get("noop_interval", 30)
     cfg.reconnect_max_wait = opts.get("reconnect_max_wait", 300)
+    cfg.status_interval = opts.get("status_interval", 600)
+    cfg.use_builtin_map = opts.get("use_builtin_map", True)
     cfg.exclude_flags = opts.get("exclude_flags", [])
 
     cfg.folder_map = data.get("folder_map", {})
     cfg.exclude_folders = data.get("exclude_folders", [])
     cfg.only_folders = data.get("only_folders", [])
+
+    errors = []
+    for label, srv in [("source", cfg.source), ("destination", cfg.destination)]:
+        if not srv.host:
+            errors.append(f"{label}.host is required")
+        if not srv.user:
+            errors.append(f"{label}.user is required")
+        if not srv.password:
+            errors.append(f"{label}.password is required")
+        if not isinstance(srv.port, int) or not (1 <= srv.port <= 65535):
+            errors.append(f"{label}.port must be integer 1-65535")
+    if errors:
+        raise ValueError("Configuration errors:\n  " + "\n  ".join(errors))
 
     return cfg
 
@@ -1034,26 +1221,31 @@ def main():
     if args.list_folders:
         conn = connect_imap(config.source, config.timeout)
         folders = list_folders(conn)
-        print(f"\n{C.BOLD}Папки на {config.source.host} ({config.source.user}):{C.RESET}\n")
+        print(f"\n{Colors.BOLD}Папки на {config.source.host} ({config.source.user}):{Colors.RESET}\n")
         for f in folders:
             decoded = decode_folder_name(f)
-            mapped = YANDEX_FOLDER_MAP.get(decoded, decoded)
-            arrow = f" -> {C.CYAN}{mapped}{C.RESET}" if mapped != decoded else ""
+            if f in config.folder_map:
+                mapped = config.folder_map[f]
+            elif config.use_builtin_map:
+                mapped = BUILTIN_FOLDER_MAP.get(decoded, BUILTIN_FOLDER_MAP.get(f, decoded))
+            else:
+                mapped = config.folder_map.get(decoded, config.folder_map.get(f, decoded)) or decoded
+            arrow = f" -> {Colors.CYAN}{mapped}{Colors.RESET}" if mapped != decoded else ""
             count = folder_message_count(conn, f)
-            count_str = f"  {C.DIM}({count} писем){C.RESET}" if count >= 0 else ""
+            count_str = f"  {Colors.DIM}({count} писем){Colors.RESET}" if count >= 0 else ""
             print(f"  {f}{arrow}{count_str}")
         conn.logout()
         return
 
     if not HAS_YAML:
         logging.warning(
-            f"{C.YELLOW}PyYAML не установлен -- конфиг должен быть JSON. "
-            f"Для YAML: pip install pyyaml{C.RESET}"
+            f"{Colors.YELLOW}PyYAML не установлен -- конфиг должен быть JSON. "
+            f"Для YAML: pip install pyyaml{Colors.RESET}"
         )
     if not HAS_TQDM:
         logging.warning(
-            f"{C.YELLOW}tqdm не установлен -- прогресс-бар недоступен. "
-            f"Установите: pip install tqdm{C.RESET}"
+            f"{Colors.YELLOW}tqdm не установлен -- прогресс-бар недоступен. "
+            f"Установите: pip install tqdm{Colors.RESET}"
         )
 
     migrator = IMAPMigrator(config, dry_run=args.dry_run)

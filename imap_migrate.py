@@ -229,12 +229,22 @@ class MigrationState:
         self.folder_stats: dict[str, dict] = {}
         self.uid_cache: dict[str, set[str]] = {}
         self.uidvalidity: dict[str, str] = {}
+        self._dirty: int = 0
+        self._last_save: float = 0.0
+        self._lock_file: Optional[Path] = None
         self._load()
 
     def _load(self):
+        tmp = self.state_file.with_suffix(".tmp")
+        candidates = []
         if self.state_file.exists():
+            candidates.append(self.state_file)
+        if tmp.exists():
+            candidates.append(tmp)
+
+        for candidate in candidates:
             try:
-                data = json.loads(self.state_file.read_text(encoding="utf-8"))
+                data = json.loads(candidate.read_text(encoding="utf-8"))
                 for folder, ids in data.get("migrated", data).items():
                     if isinstance(ids, list):
                         self.migrated[folder] = set(ids)
@@ -244,24 +254,41 @@ class MigrationState:
                         self.uid_cache[folder] = set(uids)
                 self.uidvalidity = data.get("uidvalidity", {})
                 total = sum(len(v) for v in self.migrated.values())
+                if candidate == tmp:
+                    logging.warning(f"Состояние восстановлено из резервного файла {tmp}")
                 logging.info(
                     f"Загружено состояние: {Colors.CYAN}{total}{Colors.RESET} писем "
                     f"в {len(self.migrated)} папках"
                 )
+                return
             except Exception as e:
-                logging.error(f"Не удалось загрузить state-файл: {e}")
+                logging.warning(f"Не удалось загрузить {candidate}: {e}")
+
+        if candidates:
+            logging.error("State-файл повреждён. Миграция начнётся заново.")
 
     def save(self):
-        data = {
-            "migrated": {f: sorted(ids) for f, ids in self.migrated.items()},
-            "folder_stats": self.folder_stats,
-            "uid_cache": {f: sorted(uids) for f, uids in self.uid_cache.items()},
-            "uidvalidity": self.uidvalidity,
-            "saved_at": datetime.now().isoformat(),
-        }
-        tmp = self.state_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-        tmp.replace(self.state_file)
+        try:
+            data = {
+                "migrated": {f: list(ids) for f, ids in self.migrated.items()},
+                "folder_stats": self.folder_stats,
+                "uid_cache": {f: list(uids) for f, uids in self.uid_cache.items()},
+                "uidvalidity": self.uidvalidity,
+                "saved_at": datetime.now().isoformat(),
+            }
+            tmp = self.state_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+            tmp.replace(self.state_file)
+            self._dirty = 0
+            self._last_save = time.time()
+        except Exception as e:
+            logging.critical(f"Не удалось сохранить state-файл: {e}")
+
+    def save_if_needed(self, force: bool = False) -> None:
+        """Saves state only if enough messages migrated or time elapsed since last save."""
+        now = time.time()
+        if force or self._dirty >= 500 or (now - self._last_save) >= 30.0:
+            self.save()
 
     def is_migrated(self, folder: str, message_id: str) -> bool:
         return message_id in self.migrated.get(folder, set())
@@ -275,6 +302,34 @@ class MigrationState:
         fs["bytes"] += msg_size
         if src_uid:
             self.uid_cache.setdefault(folder, set()).add(src_uid)
+        self._dirty += 1
+
+    def _acquire_lock(self) -> None:
+        lock_path = self.state_file.with_suffix(".lock")
+        if lock_path.exists():
+            try:
+                existing_pid = int(lock_path.read_text().strip())
+                try:
+                    os.kill(existing_pid, 0)
+                    raise RuntimeError(
+                        f"Другой процесс уже выполняет миграцию с этим конфигом "
+                        f"(PID {existing_pid}).\n"
+                        f"  Если процесс завершился некорректно, удалите: {lock_path}"
+                    )
+                except (ProcessLookupError, PermissionError):
+                    logging.warning(f"Удаляю устаревший lock-файл (PID {existing_pid} не запущен)")
+                    lock_path.unlink(missing_ok=True)
+            except (ValueError, OSError):
+                lock_path.unlink(missing_ok=True)
+        lock_path.write_text(str(os.getpid()))
+        self._lock_file = lock_path
+
+    def _release_lock(self) -> None:
+        if self._lock_file and self._lock_file.exists():
+            try:
+                self._lock_file.unlink()
+            except OSError:
+                pass
 
     def get_cached_uids(self, dst_folder: str) -> set[str]:
         return self.uid_cache.get(dst_folder, set()).copy()
@@ -514,20 +569,22 @@ def upload_message(
         return False
 
 
-def ensure_folder_exists(conn: imaplib.IMAP4, folder: str):
-    """Создаёт папку на целевом сервере, если её нет."""
+def ensure_folder_exists(conn: imaplib.IMAP4, folder: str) -> bool:
+    """Создаёт папку на целевом сервере, если её нет. Возвращает True при успехе."""
     try:
         status, _ = conn.status(f'"{folder}"', "(MESSAGES)")
         if status == "OK":
-            return
+            return True
     except imaplib.IMAP4.error:
         pass
     logging.info(f"  Создаю папку: {Colors.CYAN}{folder}{Colors.RESET}")
     try:
         conn.create(f'"{folder}"')
         conn.subscribe(f'"{folder}"')
+        return True
     except Exception as e:
-        logging.warning(f"  Не удалось создать папку '{folder}': {friendly_error(e)}")
+        logging.error(f"  Не удалось создать папку '{folder}': {friendly_error(e)}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +618,7 @@ class IMAPMigrator:
         self.config = config
         self.dry_run = dry_run
         self.state = MigrationState(config.state_file)
+        self.state._acquire_lock()
         self._interrupted = False
 
         self.stats: _StatsDict = {
@@ -766,7 +824,12 @@ class IMAPMigrator:
         self.stats["skipped_existing"] += len(skipped_by_cache)
 
         if not self.dry_run:
-            ensure_folder_exists(dst_conn, dst_folder)
+            if not ensure_folder_exists(dst_conn, dst_folder):
+                logging.error(f"  Папка '{dst_folder}' недоступна — пропускаю '{src_folder}'")
+                self.stats["errors"] += 1
+                folder_report["errors"] += 1
+                self.folder_reports.append(folder_report)
+                return src_conn, dst_conn
 
         batch_size = max(1, self.config.scan_batch_size)
 
@@ -917,7 +980,7 @@ class IMAPMigrator:
             if self.config.throttle > 0:
                 time.sleep(self.config.throttle)
 
-            self.state.save()
+            self.state.save_if_needed()
             if 0 < self.config.batch_limit <= total_migrated_this_run:
                 logging.info(f"  Достигнут batch_limit={self.config.batch_limit}")
                 break
@@ -1034,6 +1097,12 @@ class IMAPMigrator:
 
     def run(self) -> bool:
         """Основной цикл миграции."""
+        try:
+            return self._run()
+        finally:
+            self.state._release_lock()
+
+    def _run(self) -> bool:
         mode = f"{Colors.YELLOW}DRY-RUN{Colors.RESET}" if self.dry_run else f"{Colors.GREEN}ПЕРЕНОС{Colors.RESET}"
         start_ts = datetime.now().strftime(DATE_FORMAT)
         pid = os.getpid()
@@ -1171,8 +1240,16 @@ def load_config(path: str) -> MigrationConfig:
 
     opts = data.get("options", {})
     cfg.batch_limit = opts.get("batch_limit", 0)
-    cfg.state_file = opts.get("state_file", "migration_state.json")
-    cfg.log_file = opts.get("log_file", "migration.log")
+    config_stem = Path(path).stem
+    cfg.state_file = opts.get("state_file") or f"migration_state_{config_stem}.json"
+    cfg.log_file = opts.get("log_file") or f"migration_{config_stem}.log"
+    old_default = Path("migration_state.json")
+    if not Path(cfg.state_file).exists() and old_default.exists() and cfg.state_file != "migration_state.json":
+        logging.warning(
+            f"Обнаружен legacy state-файл migration_state.json. "
+            f"Для продолжения прерванной миграции переименуйте его:\n"
+            f"  mv migration_state.json {cfg.state_file}"
+        )
     cfg.timeout = opts.get("timeout", 120)
     cfg.throttle = opts.get("throttle", 0.05)
     cfg.max_retries = opts.get("max_retries", 3)

@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0]
+
+### Added
+
+- `TypedDict`-классы `_StatsDict` и `_FolderReport` для статически типизированных словарей статистики и отчётов по папкам.
+- Точные аннотации возвращаемых типов `tuple[imaplib.IMAP4, imaplib.IMAP4]` для `_reconnect()` и `_ensure_connection_healthy()`.
+- Аннотации параметров и возвращаемого типа для `verify_counts()` и `main()`.
+
+### Fixed
+
+- `imaplib._MAXLINE` теперь устанавливается только при наличии атрибута (`hasattr`): защита от смены приватного API в будущих версиях Python.
+- Ошибка загрузки state-файла теперь логируется на уровне `ERROR` вместо `WARNING`: потеря прогресса — это ошибка, а не предупреждение.
+- `folder_message_count` перехватывает `TypeError` дополнительно к `ValueError` и `IndexError`: защита от нетипичных ответов сервера.
+- UID передаётся в `conn.uid()` как строка (`.decode()`), а не байты — корректное соответствие сигнатуре `imaplib`.
+- Три «голых» `except Exception: pass` заменены на `except Exception as e: logging.debug(...)`: ошибки больше не теряются молча при работе с `--verbose`.
+
+### Changed
+
+- Удалён неиспользуемый импорт `email.utils`.
+- Убран f-префикс у строки без плейсхолдеров в `run()`.
+
 ## [0.2.0]
 
 ### Added

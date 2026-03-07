@@ -25,7 +25,6 @@ IMAP Mail Migration Tool
 """
 
 import imaplib
-import email.utils
 import json
 import logging
 import argparse
@@ -38,7 +37,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TypedDict
 
 try:
     import yaml
@@ -55,7 +54,8 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # IMAP: увеличиваем лимит строки (по умолчанию 10 000 -- мало для больших писем)
 # ---------------------------------------------------------------------------
-imaplib._MAXLINE = 10_000_000
+if hasattr(imaplib, "_MAXLINE"):
+    imaplib._MAXLINE = 10_000_000
 
 # ---------------------------------------------------------------------------
 # ANSI-цвета для консоли
@@ -249,7 +249,7 @@ class MigrationState:
                     f"в {len(self.migrated)} папках"
                 )
             except Exception as e:
-                logging.warning(f"Не удалось загрузить state-файл: {e}")
+                logging.error(f"Не удалось загрузить state-файл: {e}")
 
     def save(self):
         data = {
@@ -398,7 +398,7 @@ def folder_message_count(conn: imaplib.IMAP4, folder: str) -> int:
         return -1
     try:
         return int(data[0])
-    except (ValueError, IndexError):
+    except (ValueError, IndexError, TypeError):
         return -1
 
 
@@ -422,7 +422,7 @@ def fetch_message_ids_batch(
     if not uid_list:
         return []
     uid_range = b",".join(uid_list)
-    status, fetch_data = conn.uid("FETCH", uid_range, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+    status, fetch_data = conn.uid("FETCH", uid_range.decode(), "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
     if status != "OK":
         return []
 
@@ -448,7 +448,7 @@ def fetch_message_ids_batch(
 
 def fetch_full_message(conn: imaplib.IMAP4, uid: bytes) -> tuple[bytes | None, list[str], datetime | None]:
     """Скачивает полное письмо. Возвращает (raw_message, flags, internal_date)."""
-    status, data = conn.uid("FETCH", uid, "(FLAGS INTERNALDATE RFC822)")
+    status, data = conn.uid("FETCH", uid.decode(), "(FLAGS INTERNALDATE RFC822)")
     if status != "OK" or not data or data[0] is None:
         return None, [], None
 
@@ -471,8 +471,8 @@ def fetch_full_message(conn: imaplib.IMAP4, uid: bytes) -> tuple[bytes | None, l
                         parsed = imaplib.Internaldate2tuple(b'"' + date_match.group(1) + b'"')
                         if parsed:
                             internal_date = datetime(*parsed[:6])
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logging.debug(f"Date parse error: {e}")
 
             raw_message = item[1] if isinstance(item[1], bytes) else None
 
@@ -531,6 +531,29 @@ def ensure_folder_exists(conn: imaplib.IMAP4, folder: str):
 
 
 # ---------------------------------------------------------------------------
+# TypedDict definitions for stats and per-folder reports
+# ---------------------------------------------------------------------------
+class _StatsDict(TypedDict):
+    total_scanned: int
+    skipped_existing: int
+    migrated_ok: int
+    errors: int
+    skipped_no_msgid: int
+    bytes_transferred: int
+
+
+class _FolderReport(TypedDict):
+    src: str
+    dst: str
+    total: int
+    skipped: int
+    migrated: int
+    errors: int
+    bytes: int
+    elapsed: float
+
+
+# ---------------------------------------------------------------------------
 # Основной мигратор
 # ---------------------------------------------------------------------------
 class IMAPMigrator:
@@ -540,7 +563,7 @@ class IMAPMigrator:
         self.state = MigrationState(config.state_file)
         self._interrupted = False
 
-        self.stats = {
+        self.stats: _StatsDict = {
             "total_scanned": 0,
             "skipped_existing": 0,
             "migrated_ok": 0,
@@ -548,7 +571,7 @@ class IMAPMigrator:
             "skipped_no_msgid": 0,
             "bytes_transferred": 0,
         }
-        self.folder_reports: list[dict] = []
+        self.folder_reports: list[_FolderReport] = []
         self._paused = False
         self._pause_logged = False
         self.pause_file = Path(config.state_file).resolve().parent / ".migration.pause"
@@ -603,7 +626,7 @@ class IMAPMigrator:
             return False
         return True
 
-    def _reconnect(self, label: str = "") -> tuple:
+    def _reconnect(self, label: str = "") -> tuple[imaplib.IMAP4, imaplib.IMAP4]:
         prefix = f"[{label}] " if label else ""
         max_wait = max(2, self.config.reconnect_max_wait)
         wait = 2
@@ -641,7 +664,7 @@ class IMAPMigrator:
 
     def _ensure_connection_healthy(
         self, src_conn: imaplib.IMAP4, dst_conn: imaplib.IMAP4, label: str
-    ) -> tuple:
+    ) -> tuple[imaplib.IMAP4, imaplib.IMAP4]:
         """Checks both connections with NOOP; reconnects if either is dead."""
         src_ok = self._noop(src_conn)
         dst_ok = self._noop(dst_conn)
@@ -733,7 +756,7 @@ class IMAPMigrator:
         if HAS_TQDM and not self.dry_run and total > 500:
             logging.info(f"  Всего: {Colors.BOLD}{total}{Colors.RESET} писем (батчи по {self.config.scan_batch_size})")
 
-        folder_report = {
+        folder_report: _FolderReport = {
             "src": src_folder, "dst": dst_folder,
             "total": total, "skipped": len(skipped_by_cache),
             "migrated": 0, "errors": 0,
@@ -785,8 +808,8 @@ class IMAPMigrator:
                 src_conn, dst_conn = self._reconnect(src_folder)
                 try:
                     src_conn.select(f'"{src_folder}"', readonly=True)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logging.debug(f"Re-select after reconnect failed: {e}")
                 batch_messages = fetch_message_ids_batch(src_conn, batch_uids)
 
             to_migrate_batch = [
@@ -924,7 +947,7 @@ class IMAPMigrator:
 
         return src_conn, dst_conn
 
-    def verify_counts(self, src_conn, dst_conn, folders: list[tuple[str, str]]):
+    def verify_counts(self, src_conn: imaplib.IMAP4, dst_conn: imaplib.IMAP4, folders: list[tuple[str, str]]) -> None:
         """Верификация: сравнение количества писем на источнике и приёмнике."""
         logging.info(f"\n{Colors.BOLD}{'=' * 50}{Colors.RESET}")
         logging.info(f"{Colors.BOLD}  ВЕРИФИКАЦИЯ{Colors.RESET}")
@@ -1015,7 +1038,7 @@ class IMAPMigrator:
         start_ts = datetime.now().strftime(DATE_FORMAT)
         pid = os.getpid()
         logging.info(f"\n{Colors.BOLD}{'=' * 60}{Colors.RESET}")
-        logging.info(f"  IMAP Migration")
+        logging.info("  IMAP Migration")
         logging.info(f"  {self.config.source.user}@{self.config.source.host}")
         logging.info(f"      -> {self.config.destination.user}@{self.config.destination.host}")
         logging.info(f"  Режим: {mode}")
@@ -1083,8 +1106,8 @@ class IMAPMigrator:
                         logging.warning(f"  Папка '{src_f}' пропущена после {max_folder_retries} попыток")
                         try:
                             src_conn, dst_conn = self._reconnect(src_f)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logging.debug(f"Post-folder reconnect failed: {e}")
                         break
 
         elapsed = time.time() - start_time
@@ -1185,7 +1208,7 @@ def load_config(path: str) -> MigrationConfig:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="IMAP Mail Migration Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,

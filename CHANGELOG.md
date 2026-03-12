@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0]
+
+### Added
+
+- Таблица «Обзор папок» при каждом запуске (включая dry-run и resume): источник (писем / размер на диске), назначение (писем), состояние из state-файла (перенесено писем / байт), остаток к переносу (подсвечивается зелёным при 0).
+- Функция `fetch_folder_total_bytes()` — возвращает суммарный размер всех писем папки через `RFC822.SIZE` без загрузки тел сообщений (~30 байт на письмо).
+
+### Fixed
+
+- Двойной (и более) счёт в итоговом отчёте при `folder_retries > 1`: при повторных попытках `total_scanned` и `skipped_existing` умножались на число попыток. Теперь оба счётчика вычисляются из `folder_reports`, которые заполняются только при успешном завершении папки.
+
+### Changed
+
+- Удалены поля `total_scanned` и `skipped_existing` из `_StatsDict` и `self.stats` — они больше не нужны, значения вычисляются из `folder_reports` при выводе итогового отчёта.
+
 ## [0.4.0]
 
 ### Changed

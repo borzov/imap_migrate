@@ -457,6 +457,27 @@ def folder_message_count(conn: imaplib.IMAP4, folder: str) -> int:
         return -1
 
 
+def fetch_folder_total_bytes(conn: imaplib.IMAP4, folder: str) -> int:
+    """Total size of all messages in folder via RFC822.SIZE (no content downloaded)."""
+    try:
+        status, _ = conn.select(f'"{folder}"', readonly=True)
+        if status != "OK":
+            return -1
+        status, data = conn.uid("FETCH", "1:*", "(RFC822.SIZE)")
+        if status != "OK" or not data:
+            return 0
+        total = 0
+        for item in data:
+            if isinstance(item, bytes):
+                m = re.search(rb"RFC822\.SIZE (\d+)", item)
+                if m:
+                    total += int(m.group(1))
+        return total
+    except Exception as exc:
+        logging.debug(f"fetch_folder_total_bytes({folder}): {exc}")
+        return -1
+
+
 def decode_folder_name(name: str) -> str:
     """Декодирует IMAP modified UTF-7."""
     if "&" in name:
@@ -591,8 +612,6 @@ def ensure_folder_exists(conn: imaplib.IMAP4, folder: str) -> bool:
 # TypedDict definitions for stats and per-folder reports
 # ---------------------------------------------------------------------------
 class _StatsDict(TypedDict):
-    total_scanned: int
-    skipped_existing: int
     migrated_ok: int
     errors: int
     skipped_no_msgid: int
@@ -622,8 +641,6 @@ class IMAPMigrator:
         self._interrupted = False
 
         self.stats: _StatsDict = {
-            "total_scanned": 0,
-            "skipped_existing": 0,
             "migrated_ok": 0,
             "errors": 0,
             "skipped_no_msgid": 0,
@@ -820,9 +837,6 @@ class IMAPMigrator:
             "migrated": 0, "errors": 0,
             "bytes": 0, "elapsed": 0.0,
         }
-        self.stats["total_scanned"] += total
-        self.stats["skipped_existing"] += len(skipped_by_cache)
-
         if not self.dry_run:
             if not ensure_folder_exists(dst_conn, dst_folder):
                 logging.error(f"  Папка '{dst_folder}' недоступна — пропускаю '{src_folder}'")
@@ -883,7 +897,6 @@ class IMAPMigrator:
                 )
             ]
             folder_report["skipped"] += len(batch_messages) - len(to_migrate_batch)
-            self.stats["skipped_existing"] += len(batch_messages) - len(to_migrate_batch)
 
             for uid, msg_id in to_migrate_batch:
                 if self._interrupted:
@@ -1072,10 +1085,12 @@ class IMAPMigrator:
                     f"{human_duration(fr['elapsed']):>10}"
                 )
 
+        total_scanned = sum(fr["total"] for fr in self.folder_reports)
+        total_skipped = sum(fr["skipped"] for fr in self.folder_reports)
         logging.info(f"\n  {'-' * 40}")
-        logging.info(f"  Просканировано писем:   {Colors.BOLD}{s['total_scanned']}{Colors.RESET}")
-        logging.info(f"  Перенесено:             {Colors.GREEN}{s['migrated_ok']}{Colors.RESET}")
-        logging.info(f"  Пропущено (уже есть):   {s['skipped_existing']}")
+        logging.info(f"  Просканировано писем:   {Colors.BOLD}{total_scanned:,}{Colors.RESET}")
+        logging.info(f"  Перенесено:             {Colors.GREEN}{s['migrated_ok']:,}{Colors.RESET}")
+        logging.info(f"  Пропущено (уже есть):   {total_skipped:,}")
         logging.info(f"  Без Message-ID:         {s['skipped_no_msgid']}")
         if s["errors"]:
             logging.info(f"  Ошибки:                 {Colors.RED}{s['errors']}{Colors.RESET}")
@@ -1094,6 +1109,87 @@ class IMAPMigrator:
             )
 
         logging.info(f"{'=' * 60}\n")
+
+    def _print_startup_stats(
+        self,
+        src_conn: imaplib.IMAP4,
+        dst_conn: imaplib.IMAP4,
+        folder_pairs: list[tuple[str, str]],
+    ) -> None:
+        """Comprehensive per-folder overview at startup/resume."""
+        logging.info(f"\n{Colors.BOLD}  Обзор папок:{Colors.RESET}")
+
+        W_PAIR = 38
+        W_N = 9
+        W_S = 9
+
+        hdr = (
+            f"  {'Папка':<{W_PAIR}}"
+            f"{'Src':>{W_N}}{'Src MB':>{W_S}}"
+            f"{'Dst':>{W_N}}"
+            f"{'Сост':>{W_N}}{'Передано':>{W_S}}"
+            f"{'Осталось':>{W_N}}{'Данных':>{W_S}}"
+        )
+        sep = "─" * (W_PAIR + W_N * 4 + W_S * 3)
+        logging.info(f"{Colors.DIM}{hdr}{Colors.RESET}")
+        logging.info(f"  {Colors.DIM}{sep}{Colors.RESET}")
+
+        tot_src_n = tot_src_b = tot_dst_n = tot_state_n = tot_state_b = 0
+        tot_rem_n = tot_rem_b = 0
+
+        for src_f, dst_f in folder_pairs:
+            src_n = folder_message_count(src_conn, src_f)
+            src_b = fetch_folder_total_bytes(src_conn, src_f)
+            dst_n = folder_message_count(dst_conn, dst_f)
+            state_n = self.state.count(src_f)
+            state_b = self.state.folder_stats.get(dst_f, {}).get("bytes", 0)
+            rem_n = max(0, src_n - state_n) if src_n >= 0 else -1
+            rem_b = max(0, src_b - state_b) if src_b >= 0 else -1
+
+            pair = f"{src_f} → {dst_f}"
+
+            def fmt_n(v: int) -> str:
+                return f"{v:,}" if v >= 0 else "?"
+
+            def fmt_b(v: int) -> str:
+                return human_size(v) if v >= 0 else "?"
+
+            rem_col = Colors.GREEN if rem_n == 0 else (Colors.YELLOW if rem_n > 0 else "")
+            rem_end = Colors.RESET if rem_col else ""
+
+            line = (
+                f"  {pair:<{W_PAIR}}"
+                f"{fmt_n(src_n):>{W_N}}{fmt_b(src_b):>{W_S}}"
+                f"{fmt_n(dst_n):>{W_N}}"
+                f"{fmt_n(state_n):>{W_N}}{fmt_b(state_b):>{W_S}}"
+                f"{rem_col}{fmt_n(rem_n):>{W_N}}{fmt_b(rem_b):>{W_S}}{rem_end}"
+            )
+            logging.info(line)
+
+            if src_n >= 0:
+                tot_src_n += src_n
+            if src_b >= 0:
+                tot_src_b += src_b
+            if dst_n >= 0:
+                tot_dst_n += dst_n
+            tot_state_n += state_n
+            tot_state_b += state_b
+            if rem_n >= 0:
+                tot_rem_n += rem_n
+            if rem_b >= 0:
+                tot_rem_b += rem_b
+
+        logging.info(f"  {Colors.DIM}{sep}{Colors.RESET}")
+        tot_rem_col = Colors.GREEN if tot_rem_n == 0 else Colors.YELLOW
+        total_line = (
+            f"  {'Итого':<{W_PAIR}}"
+            f"{tot_src_n:>{W_N},}{human_size(tot_src_b):>{W_S}}"
+            f"{tot_dst_n:>{W_N},}"
+            f"{tot_state_n:>{W_N},}{human_size(tot_state_b):>{W_S}}"
+            f"{tot_rem_col}{tot_rem_n:>{W_N},}{human_size(tot_rem_b):>{W_S}}{Colors.RESET}"
+        )
+        logging.info(total_line)
+        logging.info("")
 
     def run(self) -> bool:
         """Основной цикл миграции."""
@@ -1150,6 +1246,8 @@ class IMAPMigrator:
         folders_to_process = [f for f in src_folders if self.should_process_folder(f)]
         folder_pairs = [(f, self.resolve_dest_folder(f)) for f in folders_to_process]
         logging.info(f"\n  К обработке: {Colors.BOLD}{len(folders_to_process)}{Colors.RESET} папок")
+
+        self._print_startup_stats(src_conn, dst_conn, folder_pairs)
 
         start_time = time.time()
 

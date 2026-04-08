@@ -71,8 +71,6 @@ class Colors:
     YELLOW = "\033[33m" if _enabled else ""
     RED    = "\033[31m" if _enabled else ""
     CYAN   = "\033[36m" if _enabled else ""
-    BLUE   = "\033[34m" if _enabled else ""
-    MAG    = "\033[35m" if _enabled else ""
 
 
 def human_size(nbytes: int | float) -> str:
@@ -648,7 +646,6 @@ class IMAPMigrator:
         }
         self.folder_reports: list[_FolderReport] = []
         self._paused = False
-        self._pause_logged = False
         self.pause_file = Path(config.state_file).resolve().parent / ".migration.pause"
 
         # Graceful shutdown

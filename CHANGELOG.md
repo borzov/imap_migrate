@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0]
+
+### Fixed
+
+- Колонка **Сост** в таблице обзора папок всегда показывала 0 при маппинге папок (например, `INBOX → INBOX`): `state.count()` вызывался с именем папки-источника, тогда как state хранит данные по имени папки-назначения. Исправлено на `state.count(dst_f)`.
+- Дата письма сдвигалась на UTC-offset хоста при записи INTERNALDATE: `time.mktime()` интерпретирует время в локальной TZ, тогда как IMAP-сервер отдаёт UTC. Заменено на `calendar.timegm()`.
+- При создании lock-файла существовало TOCTOU-окно: `exists()` и последующий `write_text()` — два отдельных вызова, при параллельном запуске двух копий оба могли пройти проверку и начать миграцию одновременно. Создание переведено на атомарный `os.open(..., O_CREAT|O_EXCL)`.
+- При верификации (`--verify`) соединения открывались в те же переменные `src_conn`/`dst_conn`, что использовались для миграции. При исключении в `verify_counts` migration-соединения оставались незакрытыми. Verify теперь работает с отдельными переменными `v_src`/`v_dst` в блоке `try/finally`.
+- После reconnect в batch-fetch повторный вызов `fetch_message_ids_batch` выполнялся без `try/except`: второй сбой уходил наверх неперехваченным. Заменено на цикл с явной обработкой второй ошибки и re-raise при исчерпании попыток.
+
+### Changed
+
+- `exclude_flags` больше не конвертируется в `set` при каждом письме: `frozenset` вычисляется один раз до начала цикла по батчам.
+- Удалены неиспользуемые константы `Colors.BLUE`, `Colors.MAG` и атрибут экземпляра `_pause_logged`.
+
 ## [0.5.0]
 
 ### Added

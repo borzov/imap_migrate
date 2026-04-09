@@ -24,6 +24,7 @@ IMAP Mail Migration Tool
   python imap_migrate.py --config config.yaml --folders INBOX,Sent
 """
 
+import calendar
 import imaplib
 import json
 import logging
@@ -304,23 +305,27 @@ class MigrationState:
 
     def _acquire_lock(self) -> None:
         lock_path = self.state_file.with_suffix(".lock")
-        if lock_path.exists():
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            self._lock_file = lock_path
+        except FileExistsError:
             try:
                 existing_pid = int(lock_path.read_text().strip())
-                try:
-                    os.kill(existing_pid, 0)
-                    raise RuntimeError(
-                        f"Другой процесс уже выполняет миграцию с этим конфигом "
-                        f"(PID {existing_pid}).\n"
-                        f"  Если процесс завершился некорректно, удалите: {lock_path}"
-                    )
-                except (ProcessLookupError, PermissionError):
-                    logging.warning(f"Удаляю устаревший lock-файл (PID {existing_pid} не запущен)")
-                    lock_path.unlink(missing_ok=True)
+                os.kill(existing_pid, 0)
+                raise RuntimeError(
+                    f"Другой процесс уже выполняет миграцию с этим конфигом "
+                    f"(PID {existing_pid}).\n"
+                    f"  Если процесс завершился некорректно, удалите: {lock_path}"
+                )
+            except (ProcessLookupError, PermissionError):
+                logging.warning(f"Удаляю устаревший lock-файл (PID не запущен)")
+                lock_path.unlink(missing_ok=True)
+                self._acquire_lock()
             except (ValueError, OSError):
                 lock_path.unlink(missing_ok=True)
-        lock_path.write_text(str(os.getpid()))
-        self._lock_file = lock_path
+                self._acquire_lock()
 
     def _release_lock(self) -> None:
         if self._lock_file and self._lock_file.exists():
@@ -562,7 +567,7 @@ def upload_message(
     raw_message: bytes,
     flags: list[str],
     internal_date: datetime | None,
-    exclude_flags: Optional[set] = None,
+    exclude_flags: Optional[frozenset[str]] = None,
 ) -> bool:
     """Uploads message to destination folder. Keeps only standard IMAP flags; drops \\Recent and non-standard keywords (e.g. $NotJunk)."""
     exclude = exclude_flags or set()
@@ -577,7 +582,7 @@ def upload_message(
 
     date_str = None
     if internal_date:
-        date_str = imaplib.Time2Internaldate(time.mktime(internal_date.timetuple()))
+        date_str = imaplib.Time2Internaldate(calendar.timegm(internal_date.timetuple()))
 
     try:
         status, _ = conn.append(f'"{folder}"', flag_str, date_str, raw_message)
@@ -859,6 +864,7 @@ class IMAPMigrator:
             if skipped_by_cache:
                 pbar.update(len(skipped_by_cache))
 
+        exclude_flags_set: frozenset[str] = frozenset(self.config.exclude_flags)
         folder_start = time.time()
         last_noop = time.time()
         last_status_time = folder_start
@@ -876,15 +882,19 @@ class IMAPMigrator:
                 self._noop(dst_conn)
                 last_noop = time.time()
 
-            try:
-                batch_messages = fetch_message_ids_batch(src_conn, batch_uids)
-            except (imaplib.IMAP4.abort, imaplib.IMAP4.error, OSError, BrokenPipeError):
-                src_conn, dst_conn = self._reconnect(src_folder)
+            for _fetch_attempt in range(2):
                 try:
-                    src_conn.select(f'"{src_folder}"', readonly=True)
-                except Exception as e:
-                    logging.debug(f"Re-select after reconnect failed: {e}")
-                batch_messages = fetch_message_ids_batch(src_conn, batch_uids)
+                    batch_messages = fetch_message_ids_batch(src_conn, batch_uids)
+                    break
+                except (imaplib.IMAP4.abort, imaplib.IMAP4.error, OSError, BrokenPipeError) as _fe:
+                    if _fetch_attempt == 0:
+                        src_conn, dst_conn = self._reconnect(src_folder)
+                        try:
+                            src_conn.select(f'"{src_folder}"', readonly=True)
+                        except Exception as e:
+                            logging.debug(f"Re-select after reconnect failed: {e}")
+                    else:
+                        raise
 
             to_migrate_batch = [
                 (uid, mid) for uid, mid in batch_messages
@@ -925,7 +935,7 @@ class IMAPMigrator:
                         msg_size = len(raw)
                         ok = upload_message(
                             dst_conn, dst_folder, raw, flags, idate,
-                            exclude_flags=set(self.config.exclude_flags),
+                            exclude_flags=exclude_flags_set,
                         )
                         if ok:
                             self.state.mark_migrated(
@@ -1138,7 +1148,7 @@ class IMAPMigrator:
             src_n = folder_message_count(src_conn, src_f)
             src_b = fetch_folder_total_bytes(src_conn, src_f)
             dst_n = folder_message_count(dst_conn, dst_f)
-            state_n = self.state.count(src_f)
+            state_n = self.state.count(dst_f)
             state_b = self.state.folder_stats.get(dst_f, {}).get("bytes", 0)
             rem_n = max(0, src_n - state_n) if src_n >= 0 else -1
             rem_b = max(0, src_b - state_b) if src_b >= 0 else -1
@@ -1278,12 +1288,20 @@ class IMAPMigrator:
 
         # Верификация
         if self.config.verify and not self.dry_run and not self._interrupted:
+            v_src = v_dst = None
             try:
-                src_conn = connect_imap(self.config.source, self.config.timeout)
-                dst_conn = connect_imap(self.config.destination, self.config.timeout)
-                self.verify_counts(src_conn, dst_conn, folder_pairs)
+                v_src = connect_imap(self.config.source, self.config.timeout)
+                v_dst = connect_imap(self.config.destination, self.config.timeout)
+                self.verify_counts(v_src, v_dst, folder_pairs)
             except Exception as e:
                 logging.warning(f"Ошибка верификации: {e}")
+            finally:
+                for _vc in (v_src, v_dst):
+                    if _vc is not None:
+                        try:
+                            _vc.logout()
+                        except Exception:
+                            pass
 
         self.print_final_report(elapsed)
 

@@ -1,0 +1,14 @@
+project_path: /Users/borzov/Develop/Public/imap_migrate
+spec_path: null
+doc_types:
+  - user-guide
+gost_mode: lite
+app_url: null
+app_launch: none
+metadata:
+  organization: ""
+  system_name: "IMAP Mail Migration Tool"
+  doc_code: ""
+  version: "1.0.0"
+  city: ""
+  year: "2026"

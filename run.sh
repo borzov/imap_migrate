@@ -90,7 +90,7 @@ setup_venv() {
     info "Устанавливаю зависимости..."
     "$VENV_DIR/bin/pip" install --upgrade pip --quiet
     "$VENV_DIR/bin/pip" install -r "$SCRIPT_DIR/requirements.txt" --quiet
-    ok "Зависимости установлены (pyyaml, tqdm)"
+    ok "Зависимости установлены (pyyaml, tqdm, orjson)"
 
     echo ""
     ok "Готово! Теперь:"

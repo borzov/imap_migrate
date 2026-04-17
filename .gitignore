@@ -14,6 +14,8 @@ migration.log
 
 # Прочее
 CLAUDE.md
+imap_migrate.egg-info/
+*.egg-info/
 .DS_Store
 __pycache__/
 *.pyc

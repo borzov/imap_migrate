@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-04-17
+
+### Added
+
+- Пакет `imap_migrate/` (модули config, state, imap_ops, migrator, cli); точка входа `imap_migrate.py` и `python -m imap_migrate`.
+- Зависимость **orjson** для быстрой записи/чтения state-файла (компактный JSON); чтение совместимо с ранее сохранёнными UTF-8 JSON из stdlib.
+- Опция `options.skip_detailed_startup_stats` — пропуск тяжёлой таблицы обзора папок при старте.
+- Опция `options.verify` в конфиге; флаг `--verify` в CLI по-прежнему включает верификацию (можно совместить с YAML).
+- Флаг `--version`.
+- Pytest и набор unit-тестов (`tests/`).
+- `pyproject.toml` (версия, зависимости, optional `dev`, entry point `imap-migrate`).
+- CI workflow (pytest на Python 3.10 и 3.12) и проверки при push тега `v*` (release workflow).
+- Документ [docs/RELEASING.md](docs/RELEASING.md) с шагами для GitHub Releases.
+
+### Fixed
+
+- «Тихий» провал батча `UID FETCH` заголовков Message-ID: при `NO`/неполном ответе батч не продвигался без обработки UID; добавлены `MessageIdBatchFetchError`, логирование и ретраи с переподключением (до `folder_retries`).
+
+### Changed
+
+- Код разнесён по модулям; публичное поведение CLI и формат данных state сохранены.
+- `upload_message`: параметр `exclude_flags` типизирован как `frozenset` end-to-end.
+- `--config` не обязателен для `--version` и `--help`.
+
 ## [0.6.0]
 
 ### Fixed

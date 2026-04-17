@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "imap-migrate"
+version = "1.0.0"
+description = "IMAP mail migration CLI with resume, UID cache, and reconnection"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "pyyaml>=6.0,<8",
+  "tqdm>=4.60,<5",
+  "orjson>=3.9,<4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0,<9",
+]
+
+[project.scripts]
+imap-migrate = "imap_migrate.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["imap_migrate"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

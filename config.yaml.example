@@ -43,6 +43,8 @@ options:
   reconnect_max_wait: 300
   status_interval: 600   # интервал вывода прогресса в лог (сек), 0 — отключить
   use_builtin_map: true  # автомаппинг папок (Яндекс/Gmail/Mail.ru → INBOX, Sent, Junk и т.д.)
+  # verify: false         # после переноса сверить число писем (перекрывается флагом --verify в CLI)
+  # skip_detailed_startup_stats: false  # true — не строить тяжёлую таблицу обзора папок при старте
   # exclude_flags: []
   verbose: false
 
